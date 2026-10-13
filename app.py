@@ -85,14 +85,9 @@ bot = Bot(token=BOT_TOKEN)
 ptb_application = Application.builder().token(BOT_TOKEN).updater(None).build()
 
 def parse_date_and_clean_text(text):
-    """
-    Extracts date ('today', 'yesterday', or 'YYYY-MM-DD') from anywhere in text.
-    Defaults to today's date.
-    """
     today = datetime.now()
     target_date = today.strftime('%Y-%m-%d')
     
-    # Check keywords
     if re.search(r'\byesterday\b', text, re.IGNORECASE):
         target_date = (today - timedelta(days=1)).strftime('%Y-%m-%d')
         text = re.sub(r'\byesterday\b', '', text, flags=re.IGNORECASE)
@@ -136,26 +131,103 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = AUTHORIZED_USERS[user_id]
     welcome_text = (
         f"👑 **Welcome {name}**!\n\n"
-        "Smart Natural Language Mode Active!\n\n"
-        "💬 **Examples you can type directly:**\n"
-        "• `Gold sip 200 today`\n"
-        "• `Silver sip 800 yesterday`\n"
-        "• `5k gold sip`\n"
-        "• `10k salary received`\n\n"
-        "📊 Use `/summary` or `/settlement` anytime."
+        "💬 **Log Naturally:** `Gold sip 200 today`\n"
+        "📊 **Check Balance:** `/summary` or `/settlement`\n\n"
+        "🗑️ **Manage Records:**\n"
+        "• `/list` - View all entries with ID numbers\n"
+        "• `/delete <ID>` - Delete a specific entry\n"
+        "• `/clearall CONFIRM` - Wipe all database history"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "📖 **Cashbook Bot Help Guide**\n\n"
-        "Just type naturally! Examples:\n"
-        "• `Gold sip 200 today` $\rightarrow$ ₹200 expense\n"
-        "• `10k freelance received` $\rightarrow$ ₹10,000 income\n"
-        "• `800 silver sip yesterday` $\rightarrow$ ₹800 expense (yesterday)\n\n"
-        "Commands: `/summary` or `/settlement`"
+        "📌 **Logging:** Type naturally (e.g., `Gold sip 200 today` or `10k salary`)\n"
+        "📊 **Summary:** `/summary` or `/settlement`\n\n"
+        "🗑️ **Deleting Entries:**\n"
+        "1. Send `/list` to get the **ID** of the wrong entry.\n"
+        "2. Send `/delete <ID>` (e.g., `/delete 5`)\n"
+        "3. To reset everything, send `/clearall CONFIRM`"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
+
+async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in AUTHORIZED_USERS:
+        return
+        
+    conn = get_db_connection()
+    df = pd.read_sql("SELECT * FROM cashbook ORDER BY id DESC LIMIT 15", conn)
+    conn.close()
+    
+    if df.empty:
+        await update.message.reply_text("ℹ️ No transactions recorded yet.")
+        return
+        
+    msg = "📋 **Recent Transactions (Use ID to Delete):**\n\n"
+    for _, row in df.iterrows():
+        t_emoji = "💸" if row['type'] == 'exp' else "💰"
+        msg += f"🆔 **#{row['id']}** | {t_emoji} `{row['date']}` | **{row['user_name']}** | ₹{row['amount']:,.2f} ({row['note']})\n"
+        
+    msg += "\n💡 *To delete an entry, type:* `/delete <ID>`"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in AUTHORIZED_USERS:
+        return
+        
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Please specify the ID to delete. Example: `/delete 5`\nUse `/list` to view entry IDs.", parse_mode="Markdown")
+        return
+        
+    try:
+        record_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid ID number.")
+        return
+        
+    conn = get_db_connection()
+    cur = conn.cursor()
+    if DATABASE_URL:
+        cur.execute("DELETE FROM cashbook WHERE id = %s", (record_id,))
+    else:
+        cur.execute("DELETE FROM cashbook WHERE id = ?", (record_id,))
+    
+    rows_deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    if rows_deleted > 0:
+        await update.message.reply_text(f"🗑️ **Entry #{record_id} has been permanently deleted!**", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ No entry found with ID **#{record_id}**.", parse_mode="Markdown")
+
+async def clearall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in AUTHORIZED_USERS:
+        return
+        
+    args = context.args
+    if not args or args[0].upper() != "CONFIRM":
+        await update.message.reply_text(
+            "⚠️ **WARNING: This will erase all past transaction history!**\n\n"
+            "To confirm deletion of all records, type:\n`/clearall CONFIRM`",
+            parse_mode="Markdown"
+        )
+        return
+        
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM cashbook;")
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    await update.message.reply_text("🧹 **All transaction history has been completely cleared!**", parse_mode="Markdown")
 
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db_connection()
@@ -179,7 +251,7 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     for _, row in df.tail(10).iterrows():
         t_emoji = "💸" if row['type'] == 'exp' else "💰"
-        summary_msg += f"{t_emoji} `{row['date']}` | **{row['user_name']}** | ₹{row['amount']:,.2f} ({row['category']}) - {row['note']}\n"
+        summary_msg += f"🆔 #{row['id']} | {t_emoji} `{row['date']}` | **{row['user_name']}** | ₹{row['amount']:,.2f} ({row['note']})\n"
         
     await update.message.reply_text(summary_msg, parse_mode="Markdown")
 
@@ -221,7 +293,6 @@ async def settlement_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
     await update.message.reply_text(settlement_msg, parse_mode="Markdown")
 
-# Robust Natural Language Message Handler
 async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
@@ -232,29 +303,24 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
     user_name = AUTHORIZED_USERS[user_id]
     text = update.message.text.strip()
     
-    # 1. Parse and remove Date keywords
     text_no_date, tx_date = parse_date_and_clean_text(text)
     
-    # 2. Extract Amount (Supports shorthand 'k'/'K' e.g. 5k, 200, 1.5k)
     amount_match = re.search(r'\b(\d+(?:\.\d+)?)([kK])?\b', text_no_date)
     if not amount_match:
-        return  # No number found in the message, ignore
+        return
         
     raw_num = float(amount_match.group(1))
     multiplier = amount_match.group(2)
     amount = raw_num * 1000 if multiplier and multiplier.lower() == 'k' else raw_num
     
-    # Remove amount from text to extract Category & Description
     start_idx, end_idx = amount_match.span()
     remaining_text = (text_no_date[:start_idx] + " " + text_no_date[end_idx:]).strip()
     words = [w for w in remaining_text.split() if w]
     
-    # 3. Detect Income vs Expense
     inc_keywords = ["salary", "income", "received", "payout", "earned", "got", "profit", "dividend"]
     full_lower = text.lower()
     tx_type = "inc" if any(kw in full_lower for kw in inc_keywords) else "exp"
     
-    # 4. Extract Category and Note
     if words:
         category = words[0].capitalize()
         note = " ".join(words)
@@ -262,7 +328,6 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
         category = "General"
         note = "Natural entry"
         
-    # 5. Save to Database
     save_transaction_to_db(tx_date, user_id, user_name, tx_type, amount, category, note)
     
     emoji = "💸" if tx_type == "exp" else "💰"
@@ -281,16 +346,17 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
 # Register Handlers
 ptb_application.add_handler(CommandHandler("start", start_command))
 ptb_application.add_handler(CommandHandler("help", help_command))
+ptb_application.add_handler(CommandHandler("list", list_command))
+ptb_application.add_handler(CommandHandler("delete", delete_command))
+ptb_application.add_handler(CommandHandler("clearall", clearall_command))
 ptb_application.add_handler(CommandHandler("summary", summary_command))
 ptb_application.add_handler(CommandHandler("settlement", settlement_command))
 
-# Handle all plain text messages for smart parsing
 ptb_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_natural_message))
 
-# Flask Webhook Route
 @app.route("/", methods=["GET"])
 def index():
-    return "Cashbook Bot is running live with NLP!", 200
+    return "Cashbook Bot is running live!", 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
