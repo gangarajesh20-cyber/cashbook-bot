@@ -3,11 +3,10 @@ import logging
 import asyncio
 import re
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+from flask import Flask, request
 import psycopg2
 import sqlite3
 import pandas as pd
-import openpyxl
 
 from telegram import Bot, Update
 from telegram.ext import (
@@ -80,40 +79,33 @@ def init_db():
     cur.close()
     conn.close()
 
-# Initialize database tables on startup
 init_db()
 
-# Initialize Telegram Bot application
 bot = Bot(token=BOT_TOKEN)
 ptb_application = Application.builder().token(BOT_TOKEN).updater(None).build()
 
-def parse_date_from_text(parts):
+def parse_date_and_clean_text(text):
     """
-    Parses date keywords ('today', 'yesterday', or YYYY-MM-DD) from the end of a list of words.
-    Defaults to today's date if omitted.
+    Extracts date ('today', 'yesterday', or 'YYYY-MM-DD') from anywhere in text.
+    Defaults to today's date.
     """
     today = datetime.now()
     target_date = today.strftime('%Y-%m-%d')
     
-    if not parts:
-        return parts, target_date
-        
-    last_word = parts[-1].lower()
-    if last_word == "today":
-        target_date = today.strftime('%Y-%m-%d')
-        parts = parts[:-1]
-    elif last_word == "yesterday":
+    # Check keywords
+    if re.search(r'\byesterday\b', text, re.IGNORECASE):
         target_date = (today - timedelta(days=1)).strftime('%Y-%m-%d')
-        parts = parts[:-1]
+        text = re.sub(r'\byesterday\b', '', text, flags=re.IGNORECASE)
+    elif re.search(r'\btoday\b', text, re.IGNORECASE):
+        target_date = today.strftime('%Y-%m-%d')
+        text = re.sub(r'\btoday\b', '', text, flags=re.IGNORECASE)
     else:
-        try:
-            datetime.strptime(last_word, '%Y-%m-%d')
-            target_date = last_word
-            parts = parts[:-1]
-        except ValueError:
-            pass
-            
-    return parts, target_date
+        date_match = re.search(r'\b\d{4}-\d{2}-\d{2}\b', text)
+        if date_match:
+            target_date = date_match.group(0)
+            text = text.replace(target_date, '')
+
+    return text.strip(), target_date
 
 def save_transaction_to_db(tx_date, user_id, user_name, tx_type, amount, category, note):
     conn = get_db_connection()
@@ -138,18 +130,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     
     if user_id not in AUTHORIZED_USERS:
-        await update.message.reply_text("⛔ You are not authorized to use this cashbook bot.")
+        await update.message.reply_text("⛔ Unauthorized user.")
         return
         
     name = AUTHORIZED_USERS[user_id]
     welcome_text = (
         f"👑 **Welcome {name}**!\n\n"
-        "You can now chat naturally or use commands!\n\n"
-        "💬 **Natural Examples:**\n"
-        "• `5k gold sip` (Automatically logged as expense)\n"
-        "• `10k salary received today` (Automatically logged as income)\n"
-        "• `250 chai yesterday`\n\n"
-        "📌 **Commands:** `/summary`, `/settlement`, `/help`"
+        "Smart Natural Language Mode Active!\n\n"
+        "💬 **Examples you can type directly:**\n"
+        "• `Gold sip 200 today`\n"
+        "• `Silver sip 800 yesterday`\n"
+        "• `5k gold sip`\n"
+        "• `10k salary received`\n\n"
+        "📊 Use `/summary` or `/settlement` anytime."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -157,44 +150,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "📖 **Cashbook Bot Help Guide**\n\n"
         "Just type naturally! Examples:\n"
-        "• `5k gold sip` $\rightarrow$ Logs ₹5,000 expense\n"
-        "• `10k freelance received` $\rightarrow$ Logs ₹10,000 income\n"
-        "• `800 silver sip yesterday` $\rightarrow$ Logs for yesterday\n\n"
-        "Or use commands: `/summary` or `/settlement`"
+        "• `Gold sip 200 today` $\rightarrow$ ₹200 expense\n"
+        "• `10k freelance received` $\rightarrow$ ₹10,000 income\n"
+        "• `800 silver sip yesterday` $\rightarrow$ ₹800 expense (yesterday)\n\n"
+        "Commands: `/summary` or `/settlement`"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
-
-async def log_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tx_type: str):
-    user = update.effective_user
-    user_id = user.id
-    if user_id not in AUTHORIZED_USERS:
-        return
-    user_name = AUTHORIZED_USERS[user_id]
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("❌ Use format: `/exp <amount> <category> <description>`", parse_mode="Markdown")
-        return
-    try:
-        amount = float(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Invalid amount.")
-        return
-    category = args[1]
-    note_parts, tx_date = parse_date_from_text(args[2:])
-    note = " ".join(note_parts) if note_parts else "No description"
-    
-    save_transaction_to_db(tx_date, user_id, user_name, tx_type, amount, category, note)
-    emoji = "💸" if tx_type == "exp" else "💰"
-    await update.message.reply_text(
-        f"✅ **{tx_type.upper()} Recorded!** {emoji}\n📅 {tx_date} | ₹{amount:,.2f} | {category} - {note}",
-        parse_mode="Markdown"
-    )
-
-async def exp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await log_command_handler(update, context, "exp")
-
-async def inc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await log_command_handler(update, context, "inc")
 
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db_connection()
@@ -216,7 +177,7 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📋 **Recent Transactions:**\n"
     )
     
-    for _, row in df.tail(5).iterrows():
+    for _, row in df.tail(10).iterrows():
         t_emoji = "💸" if row['type'] == 'exp' else "💰"
         summary_msg += f"{t_emoji} `{row['date']}` | **{row['user_name']}** | ₹{row['amount']:,.2f} ({row['category']}) - {row['note']}\n"
         
@@ -260,7 +221,7 @@ async def settlement_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
     await update.message.reply_text(settlement_msg, parse_mode="Markdown")
 
-# Smart Natural Language Message Handler
+# Robust Natural Language Message Handler
 async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
@@ -271,36 +232,37 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
     user_name = AUTHORIZED_USERS[user_id]
     text = update.message.text.strip()
     
-    # Match amount with optional 'k' or 'K' shorthand (e.g. 5k, 10.5K, 500)
-    amount_match = re.search(r'\b(\d+(?:\.\d+)?)([kK])?\b', text)
+    # 1. Parse and remove Date keywords
+    text_no_date, tx_date = parse_date_and_clean_text(text)
+    
+    # 2. Extract Amount (Supports shorthand 'k'/'K' e.g. 5k, 200, 1.5k)
+    amount_match = re.search(r'\b(\d+(?:\.\d+)?)([kK])?\b', text_no_date)
     if not amount_match:
-        return  # Not a transaction message, ignore or let other handlers process
+        return  # No number found in the message, ignore
         
     raw_num = float(amount_match.group(1))
     multiplier = amount_match.group(2)
     amount = raw_num * 1000 if multiplier and multiplier.lower() == 'k' else raw_num
     
-    # Remove amount from text to extract category, note, and date
+    # Remove amount from text to extract Category & Description
     start_idx, end_idx = amount_match.span()
-    remaining_text = (text[:start_idx] + text[end_idx:]).strip()
+    remaining_text = (text_no_date[:start_idx] + " " + text_no_date[end_idx:]).strip()
+    words = [w for w in remaining_text.split() if w]
     
-    parts = remaining_text.split()
-    parts, tx_date = parse_date_from_text(parts)
-    cleaned_lower = " ".join(parts).lower()
-    
-    # Auto-detect if it's income or expense based on keywords
+    # 3. Detect Income vs Expense
     inc_keywords = ["salary", "income", "received", "payout", "earned", "got", "profit", "dividend"]
-    tx_type = "inc" if any(kw in cleaned_lower for kw in inc_keywords) else "exp"
+    full_lower = text.lower()
+    tx_type = "inc" if any(kw in full_lower for kw in inc_keywords) else "exp"
     
-    # Extract Category and Note
-    if parts:
-        category = parts[0].capitalize()
-        note = " ".join(parts[1:]) if len(parts) > 1 else " ".join(parts)
+    # 4. Extract Category and Note
+    if words:
+        category = words[0].capitalize()
+        note = " ".join(words)
     else:
         category = "General"
         note = "Natural entry"
         
-    # Save to Database
+    # 5. Save to Database
     save_transaction_to_db(tx_date, user_id, user_name, tx_type, amount, category, note)
     
     emoji = "💸" if tx_type == "exp" else "💰"
@@ -308,7 +270,7 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
     
     await update.message.reply_text(
         f"✅ **Auto-Logged {type_label}!** {emoji}\n\n"
-        f"📅 **Date:** {tx_date}\n"
+        f"📅 **Date:** `{tx_date}`\n"
         f"👤 **By:** {user_name}\n"
         f"💵 **Amount:** ₹{amount:,.2f}\n"
         f"🏷️ **Category:** {category}\n"
@@ -319,12 +281,10 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
 # Register Handlers
 ptb_application.add_handler(CommandHandler("start", start_command))
 ptb_application.add_handler(CommandHandler("help", help_command))
-ptb_application.add_handler(CommandHandler("exp", exp_command))
-ptb_application.add_handler(CommandHandler("inc", inc_command))
 ptb_application.add_handler(CommandHandler("summary", summary_command))
 ptb_application.add_handler(CommandHandler("settlement", settlement_command))
 
-# Catch all normal text messages for smart natural language parsing
+# Handle all plain text messages for smart parsing
 ptb_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_natural_message))
 
 # Flask Webhook Route
