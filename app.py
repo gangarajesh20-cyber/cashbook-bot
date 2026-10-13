@@ -131,24 +131,28 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = AUTHORIZED_USERS[user_id]
     welcome_text = (
         f"👑 **Welcome {name}**!\n\n"
-        "💬 **Log Naturally:** `Gold sip 200 today`\n"
-        "📊 **Check Balance:** `/summary` or `/settlement`\n\n"
-        "🗑️ **Manage Records:**\n"
-        "• `/list` - View all entries with ID numbers\n"
-        "• `/delete <ID>` - Delete a specific entry\n"
-        "• `/clearall CONFIRM` - Wipe all database history"
+        "💬 **Log Naturally:** `Gold sip 200 today` or `10k salary`\n"
+        "📊 **Check Balance:** `/summary` or `/settlement`\n"
+        "📖 **Need help or management options?** Type `/help`"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "📖 **Cashbook Bot Help Guide**\n\n"
-        "📌 **Logging:** Type naturally (e.g., `Gold sip 200 today` or `10k salary`)\n"
-        "📊 **Summary:** `/summary` or `/settlement`\n\n"
-        "🗑️ **Deleting Entries:**\n"
-        "1. Send `/list` to get the **ID** of the wrong entry.\n"
-        "2. Send `/delete <ID>` (e.g., `/delete 5`)\n"
-        "3. To reset everything, send `/clearall CONFIRM`"
+        "📖 **Cashbook Bot Help & Management Guide**\n\n"
+        "📌 **1. Natural Logging Examples:**\n"
+        "• `Gold sip 200 today` $\rightarrow$ Logs ₹200 expense\n"
+        "• `10k freelance received` $\rightarrow$ Logs ₹10,000 income\n"
+        "• `800 silver sip yesterday` $\rightarrow$ Logs for yesterday\n\n"
+        "📊 **2. Financial Summaries:**\n"
+        "• `/summary` - View total income, expenses, and recent entries\n"
+        "• `/settlement` - View 50/50 split status\n\n"
+        "🗑️ **3. Record Deletion & Cleanup Options:**\n"
+        "• **Delete a Certain Entry:**\n"
+        "  1. Send `/list` to view transaction IDs.\n"
+        "  2. Send `/delete <ID>` (e.g., `/delete 3`)\n\n"
+        "• **Clear All History:**\n"
+        "  • Send `/clearall CONFIRM` to wipe all records."
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
