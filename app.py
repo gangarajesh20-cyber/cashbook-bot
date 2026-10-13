@@ -1,255 +1,348 @@
 import os
 import logging
+import asyncio
+import re
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify
+import psycopg2
 import sqlite3
 import pandas as pd
-from flask import Flask, request
-from telegram import Update, ReplyKeyboardMarkup
+import openpyxl
+
+from telegram import Bot, Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ContextTypes,
     filters,
+    ContextTypes,
 )
 
-# ==================== CONFIGURATION ====================
-BOT_TOKEN = "8905066918:AAGqIHCrvt4t_Z_BOXB16SO7Aus3XO0YKC8"
-PORT = int(os.environ.get("PORT", 8080))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+# Enable logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-USER_NAMES = {
+# Environment variables
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8905066918:AAgqTHCrvt47_BOXR16S07Aus3X08YKBC8")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+
+# Authorized Users Dictionary
+AUTHORIZED_USERS = {
     6394258624: "RAJA ( THE GOD )",
     8941572137: "DUMBU (THE DEVIL)"
 }
-ALLOWED_USERS = list(USER_NAMES.keys())
-# =======================================================
-
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-def init_db():
-    conn = sqlite3.connect('cashbook.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            username TEXT,
-            type TEXT,
-            amount REAL,
-            category TEXT,
-            description TEXT,
-            date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-init_db()
 
 app = Flask(__name__)
-telegram_app = None
 
-main_keyboard = [
-    ['➕ Add Expense', '💵 Add Income'],
-    ['📊 Cash Book Summary', '🤝 Settlement Status'],
-    ['📥 Export Cash Book', '❓ Help']
-]
-markup = ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True, selective=True)
+# Initialize Database Connection
+def get_db_connection():
+    if DATABASE_URL:
+        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        return psycopg2.connect(url)
+    else:
+        conn = sqlite3.connect("cashbook.db")
+        conn.row_factory = sqlite3.Row
+        return conn
 
-def is_authorized(user_id):
-    return user_id in ALLOWED_USERS
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_authorized(user_id):
-        await update.message.reply_text("🚫 Unauthorized access.")
-        return
-    display_name = USER_NAMES.get(user_id, "User")
-    welcome_text = (
-        f"👑 Welcome **{display_name}**!\n\n"
-        "This bot tracks combined Income, Expenses, and Cash Book data for both of you.\n\n"
-        "**Quick Command Usage:**\n"
-        "• `/exp <amount> <category> <description>`\n"
-        "• `/inc <amount> <category> <description>`"
-    )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=markup)
-
-async def add_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_authorized(user.id):
-        return
-    try:
-        args = context.args
-        if len(args) < 2:
-            await update.message.reply_text("⚠️ Usage: `/exp <amount> <category> [description]`", parse_mode="Markdown")
-            return
-        amount = float(args[0])
-        category = args[1]
-        description = " ".join(args[2:]) if len(args) > 2 else "N/A"
-        display_name = USER_NAMES.get(user.id, user.first_name)
-
-        conn = sqlite3.connect('cashbook.db')
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO transactions (user_id, username, type, amount, category, description) VALUES (?, ?, ?, ?, ?, ?)",
-                       (user.id, display_name, 'EXPENSE', amount, category, description))
-        conn.commit()
-        conn.close()
-
-        await update.message.reply_text(f"✅ **Expense Logged!**\n👤 {display_name}\n💸 Amount: {amount:.2f}\n📁 Category: {category}\n📝 Note: {description}", parse_mode="Markdown")
-    except ValueError:
-        await update.message.reply_text("⚠️ Amount must be a valid number.")
-
-async def add_income(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_authorized(user.id):
-        return
-    try:
-        args = context.args
-        if len(args) < 2:
-            await update.message.reply_text("⚠️ Usage: `/inc <amount> <category> [description]`", parse_mode="Markdown")
-            return
-        amount = float(args[0])
-        category = args[1]
-        description = " ".join(args[2:]) if len(args) > 2 else "N/A"
-        display_name = USER_NAMES.get(user.id, user.first_name)
-
-        conn = sqlite3.connect('cashbook.db')
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO transactions (user_id, username, type, amount, category, description) VALUES (?, ?, ?, ?, ?, ?)",
-                       (user.id, display_name, 'INCOME', amount, category, description))
-        conn.commit()
-        conn.close()
-
-        await update.message.reply_text(f"✅ **Income Logged!**\n👤 {display_name}\n💰 Amount: {amount:.2f}\n📁 Category: {category}\n📝 Note: {description}", parse_mode="Markdown")
-    except ValueError:
-        await update.message.reply_text("⚠️ Amount must be a valid number.")
-
-async def show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
-        return
-    conn = sqlite3.connect('cashbook.db')
-    df = pd.read_sql_query("SELECT * FROM transactions", conn)
+def init_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    if DATABASE_URL:
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS cashbook (
+                id SERIAL PRIMARY KEY,
+                date VARCHAR(50),
+                user_id BIGINT,
+                user_name VARCHAR(50),
+                type VARCHAR(20),
+                amount REAL,
+                category VARCHAR(50),
+                note TEXT
+            )
+        ''')
+    else:
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS cashbook (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT,
+                user_id INTEGER,
+                user_name TEXT,
+                type TEXT,
+                amount REAL,
+                category TEXT,
+                note TEXT
+            )
+        ''')
+    conn.commit()
+    cur.close()
     conn.close()
+
+# Initialize database tables on startup
+init_db()
+
+# Initialize Telegram Bot application
+bot = Bot(token=BOT_TOKEN)
+ptb_application = Application.builder().token(BOT_TOKEN).updater(None).build()
+
+def parse_date_from_text(parts):
+    """
+    Parses date keywords ('today', 'yesterday', or YYYY-MM-DD) from the end of a list of words.
+    Defaults to today's date if omitted.
+    """
+    today = datetime.now()
+    target_date = today.strftime('%Y-%m-%d')
+    
+    if not parts:
+        return parts, target_date
+        
+    last_word = parts[-1].lower()
+    if last_word == "today":
+        target_date = today.strftime('%Y-%m-%d')
+        parts = parts[:-1]
+    elif last_word == "yesterday":
+        target_date = (today - timedelta(days=1)).strftime('%Y-%m-%d')
+        parts = parts[:-1]
+    else:
+        try:
+            datetime.strptime(last_word, '%Y-%m-%d')
+            target_date = last_word
+            parts = parts[:-1]
+        except ValueError:
+            pass
+            
+    return parts, target_date
+
+def save_transaction_to_db(tx_date, user_id, user_name, tx_type, amount, category, note):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    if DATABASE_URL:
+        cur.execute(
+            "INSERT INTO cashbook (date, user_id, user_name, type, amount, category, note) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (tx_date, user_id, user_name, tx_type, amount, category, note)
+        )
+    else:
+        cur.execute(
+            "INSERT INTO cashbook (date, user_id, user_name, type, amount, category, note) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (tx_date, user_id, user_name, tx_type, amount, category, note)
+        )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# Command Handlers
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+    
+    if user_id not in AUTHORIZED_USERS:
+        await update.message.reply_text("⛔ You are not authorized to use this cashbook bot.")
+        return
+        
+    name = AUTHORIZED_USERS[user_id]
+    welcome_text = (
+        f"👑 **Welcome {name}**!\n\n"
+        "You can now chat naturally or use commands!\n\n"
+        "💬 **Natural Examples:**\n"
+        "• `5k gold sip` (Automatically logged as expense)\n"
+        "• `10k salary received today` (Automatically logged as income)\n"
+        "• `250 chai yesterday`\n\n"
+        "📌 **Commands:** `/summary`, `/settlement`, `/help`"
+    )
+    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "📖 **Cashbook Bot Help Guide**\n\n"
+        "Just type naturally! Examples:\n"
+        "• `5k gold sip` $\rightarrow$ Logs ₹5,000 expense\n"
+        "• `10k freelance received` $\rightarrow$ Logs ₹10,000 income\n"
+        "• `800 silver sip yesterday` $\rightarrow$ Logs for yesterday\n\n"
+        "Or use commands: `/summary` or `/settlement`"
+    )
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
+async def log_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tx_type: str):
+    user = update.effective_user
+    user_id = user.id
+    if user_id not in AUTHORIZED_USERS:
+        return
+    user_name = AUTHORIZED_USERS[user_id]
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("❌ Use format: `/exp <amount> <category> <description>`", parse_mode="Markdown")
+        return
+    try:
+        amount = float(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount.")
+        return
+    category = args[1]
+    note_parts, tx_date = parse_date_from_text(args[2:])
+    note = " ".join(note_parts) if note_parts else "No description"
+    
+    save_transaction_to_db(tx_date, user_id, user_name, tx_type, amount, category, note)
+    emoji = "💸" if tx_type == "exp" else "💰"
+    await update.message.reply_text(
+        f"✅ **{tx_type.upper()} Recorded!** {emoji}\n📅 {tx_date} | ₹{amount:,.2f} | {category} - {note}",
+        parse_mode="Markdown"
+    )
+
+async def exp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await log_command_handler(update, context, "exp")
+
+async def inc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await log_command_handler(update, context, "inc")
+
+async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = get_db_connection()
+    df = pd.read_sql("SELECT * FROM cashbook", conn)
+    conn.close()
+    
     if df.empty:
         await update.message.reply_text("ℹ️ No transactions recorded yet.")
         return
-    total_income = df[df['type'] == 'INCOME']['amount'].sum()
-    total_expense = df[df['type'] == 'EXPENSE']['amount'].sum()
-    net_cash_in_hand = total_income - total_expense
-
-    user_summary = ""
-    for u_id, name in USER_NAMES.items():
-        u_df = df[df['user_id'] == u_id]
-        u_inc = u_df[u_df['type'] == 'INCOME']['amount'].sum()
-        u_exp = u_df[u_df['type'] == 'EXPENSE']['amount'].sum()
-        user_summary += f"\n👤 **{name}**\n  • Income: {u_inc:.2f}\n  • Expense: {u_exp:.2f}\n"
-
+        
+    total_exp = df[df['type'] == 'exp']['amount'].sum()
+    total_inc = df[df['type'] == 'inc']['amount'].sum()
+    
     summary_msg = (
-        "📖 **CASH BOOK SUMMARY**\n"
-        "---------------------------\n"
-        f"💰 **Total Income:** {total_income:.2f}\n"
-        f"💸 **Total Expenses:** {total_expense:.2f}\n"
-        f"💵 **Cash in Hand:** {net_cash_in_hand:.2f}\n"
-        "---------------------------\n"
-        "**Individual Breakdown:**"
-        f"{user_summary}"
+        f"📊 **Cash Book Summary**\n\n"
+        f"💰 **Total Income:** ₹{total_inc:,.2f}\n"
+        f"💸 **Total Expenses:** ₹{total_exp:,.2f}\n"
+        f"⚖️ **Net Balance:** ₹{(total_inc - total_exp):,.2f}\n\n"
+        f"📋 **Recent Transactions:**\n"
     )
+    
+    for _, row in df.tail(5).iterrows():
+        t_emoji = "💸" if row['type'] == 'exp' else "💰"
+        summary_msg += f"{t_emoji} `{row['date']}` | **{row['user_name']}** | ₹{row['amount']:,.2f} ({row['category']}) - {row['note']}\n"
+        
     await update.message.reply_text(summary_msg, parse_mode="Markdown")
 
-async def show_settlement(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
-        return
-    conn = sqlite3.connect('cashbook.db')
-    df = pd.read_sql_query("SELECT * FROM transactions WHERE type='EXPENSE'", conn)
+async def settlement_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = get_db_connection()
+    df = pd.read_sql("SELECT * FROM cashbook", conn)
     conn.close()
+    
     if df.empty:
-        await update.message.reply_text("ℹ️ No expenses recorded to calculate settlement.")
+        await update.message.reply_text("ℹ️ No transactions recorded for settlement.")
         return
-    total_expense = df['amount'].sum()
-    per_person_share = total_expense / 2.0
+        
+    exp_df = df[df['type'] == 'exp']
+    if exp_df.empty:
+        await update.message.reply_text("ℹ️ No expenses recorded yet to split.")
+        return
+        
+    total_expense = exp_df['amount'].sum()
+    each_share = total_expense / 2
+    spent_by_user = exp_df.groupby('user_name')['amount'].sum().to_dict()
+    
+    settlement_msg = (
+        f"🤝 **50/50 Settlement Status**\n\n"
+        f"💸 **Total Expenses:** ₹{total_expense:,.2f}\n"
+        f"🎯 **Each Person's Share:** ₹{each_share:,.2f}\n\n"
+        "👤 **Paid Breakdown:**\n"
+    )
+    
+    for name in AUTHORIZED_USERS.values():
+        paid = spent_by_user.get(name, 0.0)
+        diff = paid - each_share
+        if diff > 0:
+            status = f"🟢 Owed ₹{diff:,.2f} back"
+        elif diff < 0:
+            status = f"🔴 Needs to pay ₹{abs(diff):,.2f}"
+        else:
+            status = "✨ Fully Settled"
+        settlement_msg += f"• **{name}**: Paid ₹{paid:,.2f} ({status})\n"
+        
+    await update.message.reply_text(settlement_msg, parse_mode="Markdown")
 
-    user1_id, user2_id = ALLOWED_USERS[0], ALLOWED_USERS[1]
-    u1_name, u2_name = USER_NAMES[user1_id], USER_NAMES[user2_id]
-    u1_spent = df[df['user_id'] == user1_id]['amount'].sum()
-    u2_spent = df[df['user_id'] == user2_id]['amount'].sum()
-
-    msg = f"🤝 **SETTLEMENT & BALANCE (50/50 Split)**\nTotal Combined Expenses: **{total_expense:.2f}**\nEqual Share: **{per_person_share:.2f}**\n\n"
-    msg += f"• **{u1_name}** paid: {u1_spent:.2f}\n• **{u2_name}** paid: {u2_spent:.2f}\n\n"
-
-    diff = u1_spent - per_person_share
-    if diff > 0:
-        msg += f"⚖️ **{u2_name}** owes **{u1_name}**: **{abs(diff):.2f}**"
-    elif diff < 0:
-        msg += f"⚖️ **{u1_name}** owes **{u2_name}**: **{abs(diff):.2f}**"
+# Smart Natural Language Message Handler
+async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = user.id
+    
+    if user_id not in AUTHORIZED_USERS:
+        return
+        
+    user_name = AUTHORIZED_USERS[user_id]
+    text = update.message.text.strip()
+    
+    # Match amount with optional 'k' or 'K' shorthand (e.g. 5k, 10.5K, 500)
+    amount_match = re.search(r'\b(\d+(?:\.\d+)?)([kK])?\b', text)
+    if not amount_match:
+        return  # Not a transaction message, ignore or let other handlers process
+        
+    raw_num = float(amount_match.group(1))
+    multiplier = amount_match.group(2)
+    amount = raw_num * 1000 if multiplier and multiplier.lower() == 'k' else raw_num
+    
+    # Remove amount from text to extract category, note, and date
+    start_idx, end_idx = amount_match.span()
+    remaining_text = (text[:start_idx] + text[end_idx:]).strip()
+    
+    parts = remaining_text.split()
+    parts, tx_date = parse_date_from_text(parts)
+    cleaned_lower = " ".join(parts).lower()
+    
+    # Auto-detect if it's income or expense based on keywords
+    inc_keywords = ["salary", "income", "received", "payout", "earned", "got", "profit", "dividend"]
+    tx_type = "inc" if any(kw in cleaned_lower for kw in inc_keywords) else "exp"
+    
+    # Extract Category and Note
+    if parts:
+        category = parts[0].capitalize()
+        note = " ".join(parts[1:]) if len(parts) > 1 else " ".join(parts)
     else:
-        msg += "⚖️ Both users are completely even!"
-    await update.message.reply_text(msg, parse_mode="Markdown")
+        category = "General"
+        note = "Natural entry"
+        
+    # Save to Database
+    save_transaction_to_db(tx_date, user_id, user_name, tx_type, amount, category, note)
+    
+    emoji = "💸" if tx_type == "exp" else "💰"
+    type_label = "EXPENSE" if tx_type == "exp" else "INCOME"
+    
+    await update.message.reply_text(
+        f"✅ **Auto-Logged {type_label}!** {emoji}\n\n"
+        f"📅 **Date:** {tx_date}\n"
+        f"👤 **By:** {user_name}\n"
+        f"💵 **Amount:** ₹{amount:,.2f}\n"
+        f"🏷️ **Category:** {category}\n"
+        f"📝 **Note:** {note}",
+        parse_mode="Markdown"
+    )
 
-async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
-        return
-    conn = sqlite3.connect('cashbook.db')
-    df = pd.read_sql_query("SELECT id, date, username, type, category, amount, description FROM transactions", conn)
-    conn.close()
-    if df.empty:
-        await update.message.reply_text("ℹ️ No data available to export.")
-        return
-    file_name = "CashBook_Report.xlsx"
-    df.to_excel(file_name, index=False)
-    await update.message.reply_document(document=open(file_name, 'rb'), filename=file_name, caption="📁 Here is your full Cash Book report.")
+# Register Handlers
+ptb_application.add_handler(CommandHandler("start", start_command))
+ptb_application.add_handler(CommandHandler("help", help_command))
+ptb_application.add_handler(CommandHandler("exp", exp_command))
+ptb_application.add_handler(CommandHandler("inc", inc_command))
+ptb_application.add_handler(CommandHandler("summary", summary_command))
+ptb_application.add_handler(CommandHandler("settlement", settlement_command))
 
-async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_authorized(user_id):
-        return
-    text = update.message.text
-    if text == '📊 Cash Book Summary':
-        await show_summary(update, context)
-    elif text == '🤝 Settlement Status':
-        await show_settlement(update, context)
-    elif text == '📥 Export Cash Book':
-        await export_excel(update, context)
-    elif text == '➕ Add Expense':
-        await update.message.reply_text("To add an expense, use:\n`/exp <amount> <category> <description>`", parse_mode="Markdown")
-    elif text == '💵 Add Income':
-        await update.message.reply_text("To add income, use:\n`/inc <amount> <category> <description>`", parse_mode="Markdown")
-    elif text == '❓ Help':
-        await start(update, context)
+# Catch all normal text messages for smart natural language parsing
+ptb_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_natural_message))
 
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+# Flask Webhook Route
+@app.route("/", methods=["GET"])
+def index():
+    return "Cashbook Bot is running live with NLP!", 200
+
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    json_data = request.get_json(force=True)
-    update = Update.de_json(json_data, telegram_app.bot)
-    import asyncio
-    asyncio.run(telegram_app.process_update(update))
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), bot)
+        asyncio.run(ptb_application.process_update(update))
     return "OK", 200
 
-@app.route("/")
-def index():
-    return "Bot is running live on Render!", 200
-
-def setup_telegram_bot():
-    global telegram_app
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CommandHandler("exp", add_expense))
-    telegram_app.add_handler(CommandHandler("inc", add_income))
-    telegram_app.add_handler(CommandHandler("summary", show_summary))
-    telegram_app.add_handler(CommandHandler("settle", show_settlement))
-    telegram_app.add_handler(CommandHandler("export", export_excel))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
-    
-    loop.run_until_complete(telegram_app.initialize())
-    
-    if WEBHOOK_URL:
-        loop.run_until_complete(telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}"))
-
 if __name__ == "__main__":
-    import asyncio
-    setup_telegram_bot()
-    app.run(host="0.0.0.0", port=PORT)
-  
+    if WEBHOOK_URL:
+        webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/webhook"
+        asyncio.run(bot.set_webhook(url=webhook_full_url))
+        logger.info(f"Webhook set to: {webhook_full_url}")
+    
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
